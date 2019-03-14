@@ -1,0 +1,551 @@
+package com.ws.common;
+
+import static io.restassured.RestAssured.given;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.StringReader;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+import java.util.Scanner;
+
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.soap.Node;
+import javax.xml.soap.SOAPBody;
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathConstants;
+import javax.xml.xpath.XPathExpressionException;
+import javax.xml.xpath.XPathFactory;
+
+import org.bson.BasicBSONObject;
+import org.w3c.dom.Document;
+import org.w3c.dom.NodeList;
+import org.xml.sax.InputSource;
+import org.xml.sax.SAXException;
+
+import com.api.ien.common.CommonUtil;
+import com.api.ien.topology.common.GenericDataRetriever;
+import com.api.ien.topology.common.SvcUserPropertyReader;
+import com.google.gson.Gson;
+import com.google.gson.JsonIOException;
+import com.google.gson.JsonSyntaxException;
+import com.informix.json.JSON;
+import com.jayway.jsonpath.DocumentContext;
+import com.jayway.jsonpath.JsonPath;
+import com.ws.common.reporting.ReportStep;
+import com.ws.common.reporting.ScenarioDetails;
+import io.restassured.response.Response;
+import net.minidev.json.JSONArray;
+
+public class TestAPIsWithJsonMetaData {
+	String charsToReplace = "[+\\\\-= /]";
+
+	private enum SvcType {
+		REST, SOAP
+	}
+
+	private enum SrcType {
+		DB, RESTPost, RESTGet
+	}
+
+	private ArrayList<ReportStep> rsl = new ArrayList();
+
+	public void CallAPI(ArrayList<ScenarioDetails> scnDetails, String jsonMetadataFileName) {
+		String rootFilePath = System.getProperty("user.dir");
+		File jsonMetadataFile = new File(rootFilePath + "/InputFile/JsonMeta/" + jsonMetadataFileName + ".jsonx");
+		Feature feature = new Feature();
+		if (ValidateFileExists(jsonMetadataFile)) {
+			try {
+				// Using Gson api from google, we read the json file and create our feature
+				// object instance
+				feature = new Gson().fromJson(new FileReader(jsonMetadataFile), Feature.class);
+				InvokeTestsAndValidateResults(scnDetails, feature);
+			} catch (JsonIOException e) {
+				e.printStackTrace();
+				return;
+			} catch (JsonSyntaxException e) {
+				e.printStackTrace();
+				return;
+			} catch (FileNotFoundException e) {
+				e.printStackTrace();
+				return;
+			}
+		} else {
+			return;
+		}
+
+	}
+
+	private void InvokeTestsAndValidateResults(ArrayList<ScenarioDetails> scnDetails, Feature feature) {
+		ScenarioDetails sdtl;
+		long startTime;
+		// Executing story
+		System.out.println("Executing story" + feature.StoryId);
+		for (int i = 0; i < feature.TestCases.size(); i++) {
+			startTime = System.nanoTime();
+			TestCase tc = feature.TestCases.get(i);
+			System.out.println("Executing TestCase" + tc);
+			SvcType svcType = SvcType.valueOf(tc.RequestProperties.SvcType);
+			// switch on strings is not compatible with Java 1.7. Thus created an
+			// enumeration to use.
+			try {
+				switch (svcType) {
+				case REST:
+					CallAndValidateRestApi(scnDetails, tc);
+					break;
+				case SOAP:
+					CallAndValidateSoapApi(scnDetails, feature, tc);
+					break;
+				default:
+					System.out.println(
+							"API type '" + svcType + "'/undefined or invalid. Please check the Json Meta data");
+					break;
+				}
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+
+			sdtl = new ScenarioDetails();
+			// Add story id to scenario details
+			sdtl.setJiraId(feature.StoryId);
+			// Add Test case id to scenario details
+			sdtl.setTestCaseID(tc.TestCaseId);
+			sdtl.setModuleName("VI-RestService");
+			sdtl.setRs(rsl);
+			sdtl.setDuration((System.nanoTime()) - startTime);
+			scnDetails.add(sdtl);
+		}
+	}
+
+	private void CallAndValidateSoapApi(ArrayList<ScenarioDetails> scnDetails, Feature feature, TestCase tc)
+			throws XPathExpressionException {
+		// TODO Auto-generated method stub
+		// public static void invokeSoapService(HashMap<String, String> hashMap,
+		// HashMap<String, ArrayList<String>> tagMap,
+		// ArrayList<ScenarioDetails> sd,String circuitId,String circuitIdKey,String
+		// scenarioName,String xmlRequestFileName,String tcid) {
+		ArrayList<ReportStep> rsl = new ArrayList<ReportStep>();
+		long startTime = System.nanoTime();
+		ScenarioDetails sdtl = new ScenarioDetails();
+		String xmlRequestFileName = feature.XMLName;
+		String filePath = System.getProperty("user.dir");
+
+		SOAPBody sb = GetSoapResponse(feature, tc);
+
+		if (sb == null) // Test case failed..
+		{
+			// Add scn details so that Test Space gets updated as Failed
+
+			System.out.println(
+					"Exception Reading xml :" + filePath + "/InputFile/InputXML/" + xmlRequestFileName + ".xml");
+
+			ReportStep rs = new ReportStep("when", " Performing high level validation for : " + xmlRequestFileName,
+					"Failed", "");
+			rsl.add(rs);
+			rs = new ReportStep("then", "", "FAILED", "File Not Found Exception");
+			rsl.add(rs);
+		}
+
+		else {
+			SoapTagValidation(scnDetails, tc, sb);
+
+			sdtl.setModuleName("SOAP-Services");
+			sdtl.setRs(rsl);
+			sdtl.setTestCaseID(tc.TestCaseId);
+			sdtl.setDuration((System.nanoTime()) - startTime);
+			scnDetails.add(sdtl);
+
+		}
+	}
+
+	private void CallAndValidateRestApi(ArrayList<ScenarioDetails> scnDetails, TestCase tc) {
+		Response resp = GetRestResponse(tc);
+		if (resp == null) // Test case failed..
+		{
+			// Add scn details so that Test Space gets updated as Failed
+			return;
+		}
+
+		// To handle negative test cases where the expected status code need not be
+		// 200..
+		int expStsCd = 200;
+		if (tc.RequestProperties.ExpectedStsCode != null)
+			expStsCd = Integer.parseInt(tc.RequestProperties.ExpectedStsCode);
+		rsl.add(new ReportStep("given", "Test Case ID: " + tc.TestCaseId + " - Calling service via URL : ", "PASSED",
+				tc.RequestProperties.Url));
+		System.out.println("The API Request reponse id :" + resp.asString());
+		rsl.add(new ReportStep("when", "Checking if Status is " + expStsCd, "PASSED",
+				"Checking if Status is " + expStsCd + " : " + (resp.getStatusCode() == expStsCd)));
+		System.out.println("when Checking if Status is " + expStsCd + ",PASSED,Checking if Status is " + expStsCd
+				+ (resp.getStatusCode() == expStsCd));
+		if (resp.getStatusCode() == expStsCd) {
+			String response = resp.getBody().asString();
+			System.out.println("Response is : " + response);
+			rsl.add(new ReportStep("then", " Response contains STATUS = " + expStsCd, "PASSED",
+					" Response contains STATUS = " + expStsCd));
+			System.out.println(
+					"then, Response contains STATUS = " + expStsCd + ", PASSED,Response contains STATUS = " + expStsCd);
+			System.out.println("Starting validation");
+			// Taking the response body and creating the context. We don't have to parse for
+			// each type of validation of each tag
+			DocumentContext testApiContext = JsonPath.parse(resp.getBody().asString());
+			if (tc.RequestProperties.TagsToValidate != null)
+				ValidateTags(scnDetails, tc, resp);
+			ValidateAgainstDb(scnDetails, tc, testApiContext, resp);
+		} else {
+			rsl.add(new ReportStep("then", " Response contains STATUS = " + resp.getStatusCode(), "FAILED",
+					" Response contains STATUS = " + resp.getStatusCode()));
+		}
+	}
+	
+	private void ValidateTags(ArrayList<ScenarioDetails> scnDetails, TestCase tc, Response resp) {
+		boolean bPass;
+		String rsDesc = "";
+		for (String tag : tc.RequestProperties.TagsToValidate) {
+			bPass = false;
+		
+			BasicBSONObject s = (BasicBSONObject) JSON.parse(resp.asString());
+			System.out.println(s.containsField(tag));
+			System.out.println(s.getClass() );
+				// ((JSonarray)s).read(tag.replace("!", ""));
+			System.out.println("The tag we read has value '" + s + "' and is of type : " + s.getClass());
+			if (tag.startsWith("!")) // Negative test case.. It is to validate such a tag should NOT be present
+			// set bPass=true only if the tag is NOT present
+			{
+
+				if (true) {
+				} else {
+				}
+				rsDesc = "Check tag '" + tag + "' is NOT present in the response";
+			} else // set bPass=true if the tag is present
+			{
+				if (false) {
+				} else {
+				}
+				rsDesc = "Check tag '" + tag + "' is present in the response";
+			}
+			System.out.println(rsDesc);
+			if (bPass) {
+				// rsl.add(new ReportStep("then", "", "PASSED", rsDesc));
+			} else {
+				// rsl.add(new ReportStep("then", "", "FAILED", rsDesc));
+			}
+		}
+	}
+
+	private void ValidateAgainstDb(ArrayList<ScenarioDetails> scnDetails, TestCase tc, DocumentContext testApiContext,
+			Response resp) {
+		String expectedValue = "";
+		String actualValue = "";
+		String rsDesc = "";
+		for (Query qry : tc.Queries) {
+			List<Map<String, String>> data = new GenericDataRetriever().GetData(qry.ConnectionId, qry.SQLQuery);
+			for (Mapper mp : qry.MapperList) {
+				if (mp.expression != null) {
+					actualIsTrueOrFalse(resp, data, mp, tc);
+				} else if (mp.columnName != null) {
+					if (mp.columnName.contains("[")) {
+						// Place holder to check exact row from the DB against an exact value using
+						// JSONpath expression. Keep in mind that the query in the DB should have an
+						// appropriate order by clause that matches the JSON object/value in the
+						// response
+						// expectedValue = data.read(key).toString();
+					} else {
+						if (mp.IsJArraySize) {
+							actualCountMatchesExpected(testApiContext, data, mp);
+						} else {
+							actualFoundInExpectedData(actualValue, expectedValue, testApiContext, data, mp, rsDesc);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	private void SoapTagValidation(ArrayList<ScenarioDetails> scnDetails, TestCase tc, SOAPBody sb)
+			throws XPathExpressionException {
+		ReportStep rs;
+		Node rootNode = (Node) sb.getFirstChild();
+		// check if root node name is 'callVIGenericOutgoingWebServiceResponse'
+		if (rootNode.getNodeType() == Node.ELEMENT_NODE
+				&& rootNode.getNodeName().contains("callVIGenericOutgoingWebServiceResponse")) {
+			// check for return node which contains CDATA (XML as Text)
+			if (rootNode.getFirstChild().getNodeName().contains("return")) {
+				// Extract XML Text in the <return> tag , first child is return and its child is
+				// CDATA Text
+				String xmlData = rootNode.getFirstChild() != null
+						? rootNode.getFirstChild().getFirstChild().getNodeValue()
+						: null;
+
+				// check if xmlData is null, if not null validate response else fail test case
+				if (xmlData != null) {
+					DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+					try {
+
+						// Prepare DocumentBuilder instance to build DOM Document from an XML
+						DocumentBuilder builder = factory.newDocumentBuilder();
+						InputSource is = new InputSource(new StringReader(xmlData));
+						Document doc = builder.parse(is);
+
+						doc.getDocumentElement().normalize();
+						// System.out.println("Root element " + doc.getDocumentElement().getNodeName());
+
+						for (Query qry : tc.Queries) {
+							for (Mapper mp : qry.MapperList) {
+								if (mp.columnName != null) {
+									XPath xPath = XPathFactory.newInstance().newXPath();
+									NodeList nodeList = (NodeList) xPath.compile(mp.xPath).evaluate(doc,
+											XPathConstants.NODESET);
+									String expression = mp.xPath;
+									if (nodeList.getLength() > 0) {
+										System.out.println("PASSED: " + expression + " path exists");
+										rs = new ReportStep("then", "", "PASSED",
+												"Tag:" + expression + " is present in the response under TAG :");
+										rsl.add(rs);
+
+									} else {
+										System.out.println("FAILED: " + expression + " path not exists");
+										rs = new ReportStep("then", "", "FAILED",
+												"Tag:" + expression + " is not present in the response under TAG :");
+										rsl.add(rs);
+									}
+
+								}
+
+							}
+
+							System.out.println(qry.Validation + " is Completed");
+							rs = new ReportStep("then", "", "", "" + qry.Validation + " Tag is completed");
+							rsl.add(rs);
+						}
+
+						if (tc.IsDataValidationRequired.equalsIgnoreCase("Yes")) {
+
+							for (Query qry : tc.Queries) {
+								List<Map<String, String>> dbData = new GenericDataRetriever().GetData(qry.ConnectionId,
+										qry.SQLQuery);
+								for (Map<String, String> map : dbData) {
+									for (Mapper mp : qry.MapperList) {
+										if (mp.columnName != null) {
+											XPath xPath = XPathFactory.newInstance().newXPath();
+											NodeList nodeList = (NodeList) xPath.compile(mp.xPath).evaluate(doc,
+													XPathConstants.NODESET);
+											String actualValue = nodeList.item(0).getTextContent();
+											System.out.println("Actual Value :" + actualValue);
+
+											String expectedValue = map.get(mp.columnName.toLowerCase()).toString();
+											System.out.println("Expected Value :" + expectedValue);
+											if (actualValue.replaceAll(charsToReplace, "")
+													.contains(expectedValue.replaceAll(charsToReplace, ""))) {
+												System.out.println("Actual value(s) of element '" + mp.xPath
+														+ "' equals expected value(s) of element '" + mp.columnName
+														+ "'");
+												// The values match
+												rsl.add(new ReportStep("then", "", "PASSED",
+														"The response value '" + actualValue
+																+ "' matches expected DB values(s) '" + expectedValue
+																+ "'"));
+												System.out.println("then,PASSED, The value '" + actualValue + "'='"
+														+ expectedValue);
+
+											} else {
+												System.out.println("FAILED: " + mp.columnName + " data not matched");
+												rs = new ReportStep("then", "", "FAILED", "Tag:" + mp.columnName
+														+ " data not matched with the data in TAG: " + mp.xPath);
+												rsl.add(rs);
+											}
+
+										}
+
+									}
+								}
+
+								System.out.println("Data Validation for " + qry.Validation + " is Completed");
+								rs = new ReportStep("then", "", "",
+										"Data Validation for " + qry.Validation + " is completed");
+								rsl.add(rs);
+							}
+
+						}
+
+					}
+
+					catch (ParserConfigurationException e) {
+						// TODO handle exception
+					} catch (SAXException e) {
+						// TODO handle exception
+					} catch (IOException e) {
+						// TODO handle exception
+					}
+
+				}
+			}
+		} else {
+
+			rs = new ReportStep("then", "Validating tags", "FAILED", "No data found in the reponse");
+			rsl.add(rs);
+		}
+	}
+
+	private void actualIsTrueOrFalse(Response resp, List<Map<String, String>> data, Mapper mp, TestCase tc) {
+		String actualValue = resp.asString();
+		boolean bActualValue = false;
+		if (actualValue.equalsIgnoreCase("true"))
+			bActualValue = true;
+
+		rsl.add(new ReportStep("given", "Given to check the response value ", "PASSED",
+				"Given API is  : " + tc.RequestProperties.Url));
+
+		rsl.add(new ReportStep("when", "Checking if response is returing True / False ", "PASSED",
+				"Checking if Status is 200 OK " + (resp.getStatusCode() == 200)));
+		System.out.println("The API Request reponse id :" + resp.asString());
+		if (mp.expression.equalsIgnoreCase("COUNT(*)>0")) {
+			if (bActualValue == Integer.parseInt(data.get(0).get("COUNT(*)")) > 0) {
+				System.out.println("Value matches");
+				rsl.add(new ReportStep("then", "", "PASSED",
+						"The value '" + actualValue + "'='" + Integer.parseInt(data.get(0).get("COUNT(*)"))));
+			} else {
+				rsl.add(new ReportStep("then", "", "FAILED",
+						"The value '" + actualValue + "'!='" + Integer.parseInt(data.get(0).get("COUNT(*)"))));
+				System.out.println("Value does NOT match");
+			}
+		}
+	}
+
+	private void actualCountMatchesExpected(DocumentContext testApiContext, List<Map<String, String>> data, Mapper mp) {
+		List aVal = testApiContext.read(mp.JSONPath);
+		JSONArray jarr = (JSONArray) aVal.get(0);
+		int iActualValue = jarr.size();
+		System.out.println("The object array count from response is :" + iActualValue);
+		// We don't want to deal with Case sensitivity. Thus we would use count(*)
+		int iExpectedValue = Integer.parseInt(data.get(0).get("count(*)"));
+		System.out.println("The count from DB is :" + iExpectedValue);
+		if (iActualValue == iExpectedValue) {
+			rsl.add(new ReportStep("then", "", "PASSED", "The value '" + iActualValue + "'='" + iExpectedValue));
+		} else {
+			rsl.add(new ReportStep("then", "", "FAILED",
+					"The value '" + iActualValue + "' is NOT equal to '" + iExpectedValue));
+		}
+	}
+
+	private void actualFoundInExpectedData(String actualValue, String expectedValue, DocumentContext testApiContext,
+			List<Map<String, String>> data, Mapper mp, String rsDesc) {
+		boolean bFound = false;
+		String keyName = getLastSegment(mp.JSONPath, "[.]");
+		rsl.add(new ReportStep("when", "", "PASSED",
+				"checking value in tag '" + keyName + "' matches value in DB query '" + mp.columnName + "'"));
+		for (Map<String, String> map : data) {
+			try {
+				// If the JSONPath defined is incorrect we need not continue this test step
+				actualValue = testApiContext.read(mp.JSONPath).toString();
+				// If the column name is not found in the result set data we need not continue
+				// this test step
+				Object evObj = map.get(mp.columnName.toLowerCase());
+				if (evObj != null)
+					expectedValue = evObj.toString();
+				else
+					continue;
+			} catch (Exception e) {
+				// Either the JSONPath or Column name is Invalid..
+				rsDesc = "Check both json path '" + keyName + "' is valid AND DB column name '" + mp.columnName
+						+ "' is valid";
+				System.out.println(rsDesc);
+				rsl.add(new ReportStep("then", "", "FAILED", rsDesc));
+				e.printStackTrace();
+				// Continue to test the rest of the tags against DB columns
+				continue;
+			}
+			System.out
+					.println("The tag '" + mp.JSONPath + "' has value(s): " + actualValue + " in the API being tested");
+
+			// The actual value from JSONPath looks like an array. Thus using Contains
+			// instead of equalsIgnoreCase
+			// if (actualValue.equalsIgnoreCase(expectedValue)) {
+			// Compare with normalized strings
+			if (actualValue.replaceAll(charsToReplace, "").contains(expectedValue.replaceAll(charsToReplace, ""))) {
+				System.out.println("Actual value(s) of element '" + mp.JSONPath
+						+ "' equals expected value(s) of element '" + mp.columnName + "'");
+				// The values match
+				rsl.add(new ReportStep("then", "", "PASSED", "The response value '" + actualValue
+						+ "' matches expected DB values(s) '" + expectedValue + "'"));
+				System.out.println("then,PASSED, The value '" + actualValue + "'='" + expectedValue);
+				bFound = true;
+				break;
+			}
+		}
+		if (!bFound) {
+			System.out.println("Actual value(s) is NOT equal to expected value(s)");
+			// The actual value from the REST API does DONT match any value from the DB
+			// query
+			rsl.add(new ReportStep("then", "", "FAILED", "The response value '" + actualValue
+					+ "' does NOT match expected DB values(s) '" + expectedValue + "'"));
+		}
+	}
+
+	private String getLastSegment(String strVal, String pathSep) {
+		System.out.println(strVal);
+		String[] sArr = strVal.split(pathSep);
+		return sArr[sArr.length - 1];
+	}
+
+	private Response GetRestResponse(TestCase tc) {
+		Response resp = null;
+		try {
+			String user = tc.RequestProperties.SvcUser;
+			String pass = new SvcUserPropertyReader().readProperty(tc.RequestProperties.SvcUser);
+			String cred = user + ":" + pass;
+			String enc = Base64.getEncoder().encodeToString(cred.getBytes());
+			resp = given().auth().preemptive().basic(user, pass).when().get(tc.RequestProperties.Url);
+			System.out.println(resp.asString());
+		} catch (Exception ex) {
+			ex.printStackTrace();
+		}
+		return resp;
+	}
+
+	private SOAPBody GetSoapResponse(Feature feature, TestCase tc) {
+		SOAPBody sb = null;
+		try {
+			String inputXMLRequest = "";
+			String webServiceURL = tc.RequestProperties.Url;
+			String xmlRequestFileName = feature.XMLName;
+			String filePath = System.getProperty("user.dir");
+
+			inputXMLRequest = new Scanner(new File(filePath + "/InputFile/InputXML/" + xmlRequestFileName + ".xml"))
+					.useDelimiter("\\Z").next();
+
+			if (webServiceURL != null) {
+				for (XMLInput xmlInp : tc.RequestProperties.XMLInputs) {
+
+					inputXMLRequest = inputXMLRequest.replaceAll(xmlInp.Name, xmlInp.Value); // replaceAll(circuitIdKey,
+																								// circuitId);
+				}
+
+				sb = CommonUtil.invokeSOAPService(webServiceURL, inputXMLRequest);
+
+			}
+		} catch (Exception ex) {
+			ex.printStackTrace();
+		}
+		return sb;
+	}
+
+	private boolean ValidateFileExists(File jsonMetadataFile) {
+		if (jsonMetadataFile.isDirectory()) {
+			System.out.println("Please delete the directory '" + jsonMetadataFile
+					+ ".json' and create a valid Json with test meta data");
+			return false;
+		}
+		if (!jsonMetadataFile.exists()) {
+			System.out.println("The file '" + jsonMetadataFile + ".json' is required to test this feature");
+			return false;
+		}
+		return true;
+	}
+}
